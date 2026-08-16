@@ -1,0 +1,32 @@
+# CRITICAL: the Dockerfile does `COPY . .`, so without this the live private key
+# is baked into every image layer and readable by anyone who pulls it.
+# .env is supplied at runtime via docker-compose `env_file:`, never at build time.
+.env
+.env.example
+
+# Git
+.git/
+.gitignore
+
+# Python cache / envs
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+
+# Tests and docs — not needed in the runtime image
+test_*.py
+*_test.py
+tests/
+*.md
+
+# Logs
+*.log
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

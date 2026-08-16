@@ -1,0 +1,28 @@
+# Secrets — API_PRIVATE_KEY / APIV1_PRIVATE_KEY live here
+.env
+
+# Logs
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Editor/tooling backups - never commit
+*.bak
+*.bak-*
+*.backup
+*_backup.py
+
+# Local working artifacts - not for the public repo
+*.zip
+test1.png
+test2.png

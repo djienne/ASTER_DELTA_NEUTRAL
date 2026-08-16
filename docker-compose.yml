@@ -1,0 +1,20 @@
+version: '3.8'
+
+services:
+  dn_bot:
+    build: .
+    container_name: dn_bot
+    env_file:
+      - .env
+    # Keep stdin open to allow for interactive terminal input
+    stdin_open: true
+    # Allocate a pseudo-TTY
+    tty: true
+    # Mount the source code into the container for live updates
+    volumes:
+      - ./delta_neutral_bot.py:/app/delta_neutral_bot.py
+      - ./aster_api_manager.py:/app/aster_api_manager.py
+      - ./strategy_logic.py:/app/strategy_logic.py
+      - ./ui_renderers.py:/app/ui_renderers.py
+      - ./cli_commands.py:/app/cli_commands.py
+      - ./utils.py:/app/utils.py
