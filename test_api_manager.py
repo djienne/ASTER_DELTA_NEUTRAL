@@ -283,14 +283,23 @@ class TestAsterApiManager(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(btc_analysis['perp_position'], -1.0)
         self.assertEqual(btc_analysis['net_delta'], 0.0)  # 1.0 + (-1.0) = 0
         self.assertTrue(btc_analysis['is_delta_neutral'])
+        self.assertTrue(btc_analysis['is_balanced'])
         self.assertAlmostEqual(btc_analysis['imbalance_pct'], 0.0, places=1)
 
-        # Verify ETHUSDT position (should be imbalanced with 2% threshold)
+        # Verify ETHUSDT position: a DN position that has DRIFTED past tolerance.
+        #
+        # `is_delta_neutral` is now the structural question ("are both legs
+        # present?"), which stays True here, and `is_balanced` carries the health
+        # question, which is False. Previously both were the same flag, so this
+        # position dropped out of the health check AND out of the dashboard's
+        # closeable list at exactly the point it started needing attention.
         eth_analysis = analysis['ETHUSDT']
         self.assertEqual(eth_analysis['spot_balance'], 1.95)
         self.assertEqual(eth_analysis['perp_position'], -2.0)
         self.assertAlmostEqual(eth_analysis['net_delta'], -0.05, places=6)  # 1.95 + (-2.0) = -0.05
-        self.assertFalse(eth_analysis['is_delta_neutral'])  # 2.5% > 2% threshold
+        self.assertTrue(eth_analysis['is_delta_neutral'],
+                        "a drifted position must stay visible and closeable")
+        self.assertFalse(eth_analysis['is_balanced'])  # 2.5% > 2% tolerance
         self.assertAlmostEqual(eth_analysis['imbalance_pct'], 2.5, places=1)  # 0.05/2.0 * 100
 
         await manager.close()

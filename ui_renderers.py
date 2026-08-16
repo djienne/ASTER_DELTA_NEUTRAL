@@ -13,10 +13,17 @@ def render_funding_rates_table(funding_data, title="Funding Rates (sorted by APR
     """Common function to render funding rates table with effective APR column.
 
     Args:
-        funding_data: List of funding rate dictionaries with 'symbol', 'rate', 'apr' keys
+        funding_data: List of funding rate dictionaries with 'symbol', 'rate', 'apr'
+            keys, and optionally 'interval_hours' / 'interval_source'
         title: Title to display above the table
         show_summary: Whether to show summary statistics
         indent: String to prepend to each line for indentation
+
+    The Interval column is shown because the APR depends entirely on it and Aster
+    runs 1h, 4h and 8h simultaneously. Two symbols with the same per-interval rate
+    have APRs 8x apart, and without the cadence on screen that looks like a bug.
+    A '~' marks an interval inferred from settlement timestamps rather than read
+    from the venue.
     """
     if not funding_data:
         print(Fore.YELLOW + f"{indent}No funding rate data available." + Style.RESET_ALL)
@@ -25,7 +32,8 @@ def render_funding_rates_table(funding_data, title="Funding Rates (sorted by APR
     print(Fore.GREEN + f"{indent}{title}:\n" + Style.RESET_ALL)
 
     # Display header
-    header = f"{'Symbol':<12} {'Current Rate':>15} {'APR (%)':>20} {'Effective APR (%)':>18}"
+    header = (f"{'Symbol':<12} {'Current Rate':>15} {'Interval':>10} "
+              f"{'APR (%)':>20} {'Effective APR (%)':>18}")
     print(f"{indent}{header}")
     print(f"{indent}" + "-" * len(header))
 
@@ -36,7 +44,17 @@ def render_funding_rates_table(funding_data, title="Funding Rates (sorted by APR
         effective_apr = apr / 2  # Divide by 2 since leverage is 1x for delta-neutral
         apr_color = Fore.GREEN if apr > 0 else Fore.RED
         effective_color = Fore.GREEN if effective_apr > 0 else Fore.RED
-        print(f"{indent}{item['symbol']:<12} {rate:>15.6f} {apr_color}{apr:>20.2f}{Style.RESET_ALL} {effective_color}{effective_apr:>18.2f}{Style.RESET_ALL}")
+
+        hours = item.get('interval_hours')
+        if hours is None:
+            interval = "?"
+        else:
+            marker = "~" if item.get('interval_source') == 'empirical' else ""
+            interval = f"{marker}{hours:g}h"
+
+        print(f"{indent}{item['symbol']:<12} {rate:>15.6f} {interval:>10} "
+              f"{apr_color}{apr:>20.2f}{Style.RESET_ALL} "
+              f"{effective_color}{effective_apr:>18.2f}{Style.RESET_ALL}")
 
     if show_summary:
         # Summary statistics

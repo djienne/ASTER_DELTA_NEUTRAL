@@ -9,12 +9,32 @@ import typing
 import statistics
 from typing import List, Dict, Optional, Tuple, Any
 
+HOURS_PER_YEAR = 24 * 365  # 8760
+
+# Only used when a caller supplies no interval map at all (the example scripts).
+# Real callers pass per-symbol intervals resolved from the venue -- see
+# AsterApiManager.resolve_funding_interval().
+LEGACY_ASSUMED_FUNDING_INTERVAL_HOURS = 8.0
+
 # Strategy constants for easy tuning
-ANNUALIZED_APR_THRESHOLD = 15.0  # Minimum annual percentage rate to consider
+#
+# NOTE: ANNUALIZED_APR_THRESHOLD is a DISPLAY filter, not an entry gate. It is a
+# gross number with no cost term, and a full cycle here is four taker fills
+# (~16bps round trip at Aster's 4bps), which at an 8h hold breaks even around
+# 175% APR. The real entry decision belongs to funding_economics.evaluate_entry().
+ANNUALIZED_APR_THRESHOLD = 15.0  # Minimum annual percentage rate to display
 MIN_FUNDING_RATE_COUNT = 10      # Minimum historical data points required
-MAX_VOLATILITY_THRESHOLD = 0.05  # Maximum coefficient of variation for stability
+# Coefficient of variation = stdev/mean. Real funding series routinely exceed 1,
+# so the old 0.05 demanded a rate that barely moved and filtered out essentially
+# every genuine opportunity. 1.5 admits normal variation while still rejecting a
+# series whose mean is dominated by noise.
+MAX_VOLATILITY_THRESHOLD = 1.5   # Maximum coefficient of variation for stability
 LIQUIDATION_BUFFER_PCT = 0.05    # 5% buffer from liquidation price
 IMBALANCE_THRESHOLD_PCT = 5.0    # Maximum allowed position imbalance percentage
+# Below this, a position is treated as structurally balanced. It is a HEALTH
+# band, not the test for "is this a delta-neutral position at all" -- see
+# analyze_position_data.
+DELTA_NEUTRAL_TOLERANCE_PCT = 2.0
 HIGH_RISK_LIQUIDATION_PCT = 2.0  # Liquidation risk percentage considered HIGH
 
 
@@ -127,7 +147,8 @@ class DeltaNeutralLogic:
     @staticmethod
     def analyze_funding_opportunities(
         funding_histories: Dict[str, List[float]],
-        spot_prices: Dict[str, float]
+        spot_prices: Dict[str, float],
+        interval_hours: Optional[Dict[str, float]] = None
     ) -> List[Dict[str, Any]]:
         """
         Analyze funding rate histories to identify profitable opportunities.
@@ -135,11 +156,18 @@ class DeltaNeutralLogic:
         Args:
             funding_histories: Dict mapping symbol -> list of funding rates
             spot_prices: Dict mapping symbol -> current spot price
+            interval_hours: Dict mapping symbol -> funding interval in hours.
+                Aster runs 1h, 4h and 8h intervals simultaneously, so annualizing
+                every symbol on the same constant is wrong for most of the book.
+                A symbol with no entry here is SKIPPED rather than guessed at --
+                resolve it via AsterApiManager.resolve_funding_interval().
+                Omit the argument entirely to keep the legacy 8h assumption, which
+                exists only so the example scripts still run.
 
         Returns:
             List of opportunity dictionaries sorted by annualized APR descending.
             Each dict contains: symbol, mean_funding, stdev_funding, annualized_apr,
-            coefficient_of_variation, data_points_count, spot_price
+            coefficient_of_variation, data_points_count, spot_price, interval_hours
         """
         opportunities = []
 
@@ -148,6 +176,13 @@ class DeltaNeutralLogic:
                 continue
 
             if symbol not in spot_prices:
+                continue
+
+            if interval_hours is None:
+                hours = LEGACY_ASSUMED_FUNDING_INTERVAL_HOURS
+            elif symbol in interval_hours and interval_hours[symbol] > 0:
+                hours = float(interval_hours[symbol])
+            else:
                 continue
 
             # Calculate statistics
@@ -165,8 +200,8 @@ class DeltaNeutralLogic:
             if coefficient_of_variation > MAX_VOLATILITY_THRESHOLD:
                 continue
 
-            # Annualize the funding rate (assuming 8-hour intervals, 3 times per day)
-            annualized_apr = mean_funding * 3 * 365 * 100  # Convert to percentage
+            # Annualize using this symbol's ACTUAL settlement cadence.
+            annualized_apr = mean_funding * (HOURS_PER_YEAR / hours) * 100
 
             # Only include opportunities above threshold
             if annualized_apr >= ANNUALIZED_APR_THRESHOLD:
@@ -177,7 +212,8 @@ class DeltaNeutralLogic:
                     'annualized_apr': annualized_apr,
                     'coefficient_of_variation': coefficient_of_variation,
                     'data_points_count': len(funding_rates),
-                    'spot_price': spot_prices[symbol]
+                    'spot_price': spot_prices[symbol],
+                    'interval_hours': hours
                 })
 
         # Sort by annualized APR descending
@@ -260,8 +296,12 @@ class DeltaNeutralLogic:
         # Calculate net delta (should be close to 0 for delta-neutral)
         net_delta = spot_balance_qty + perp_quantity  # Note: perp_quantity is negative for short
 
-        # Calculate imbalance percentage
-        total_position_size = abs(perp_quantity)
+        # Calculate imbalance percentage.
+        #
+        # Denominator is max(|spot|, |perp|), matching analyze_position_data. It
+        # used to be |perp| here and max(...) there, so the same position reported
+        # two different imbalance figures depending on which screen you looked at.
+        total_position_size = max(abs(spot_balance_qty), abs(perp_quantity))
         if total_position_size > 0:
             imbalance_percentage = abs(net_delta) / total_position_size * 100
         else:
@@ -289,9 +329,14 @@ class DeltaNeutralLogic:
             else:
                 liquidation_risk_level = 'LOW'
 
-        # Warn if leverage is not 1x for delta-neutral strategy
-        if leverage != 1:
-            liquidation_risk_level = 'CRITICAL'  # Force attention to leverage issue
+        # Wrong leverage is its own problem, reported in its own field.
+        #
+        # It used to overwrite liquidation_risk_level with 'CRITICAL'. That
+        # DESTROYED the liquidation reading: a position at 3x that was also close
+        # to liquidation reported 'CRITICAL' instead of 'HIGH', and
+        # determine_rebalance_action only tested for 'HIGH' -- so the single most
+        # dangerous state the bot can be in returned ACTION_HOLD.
+        leverage_critical = leverage != 1
 
         # Calculate position value
         position_value_usd = abs(perp_quantity) * mark_price
@@ -301,6 +346,7 @@ class DeltaNeutralLogic:
             'imbalance_percentage': imbalance_percentage,
             'liquidation_risk_pct': liquidation_risk_pct,
             'liquidation_risk_level': liquidation_risk_level,
+            'leverage_critical': leverage_critical,
             'position_value_usd': position_value_usd,
             'unrealized_pnl': unrealized_pnl,
             'total_position_size': total_position_size,
@@ -324,11 +370,20 @@ class DeltaNeutralLogic:
         liquidation_risk_level = health_report.get('liquidation_risk_level', 'NONE')
         imbalance_percentage = health_report.get('imbalance_percentage', 0.0)
 
-        # Priority 1: Close position if liquidation risk is high
-        if liquidation_risk_level == 'HIGH':
+        # Priority 1: Close position if liquidation risk is high.
+        #
+        # 'CRITICAL' is accepted as well as 'HIGH'. Older health reports encoded a
+        # wrong-leverage position as liquidation_risk_level='CRITICAL', and testing
+        # only for 'HIGH' meant that state fell through to ACTION_HOLD.
+        if liquidation_risk_level in ('HIGH', 'CRITICAL'):
             return 'ACTION_CLOSE_POSITION'
 
-        # Priority 2: Rebalance if position is significantly imbalanced
+        # Priority 2: Wrong leverage on a delta-neutral position is not something
+        # to sit on -- at anything above 1x the "hedged" position can be liquidated.
+        if health_report.get('leverage_critical'):
+            return 'ACTION_CLOSE_POSITION'
+
+        # Priority 3: Rebalance if position is significantly imbalanced
         if imbalance_percentage >= IMBALANCE_THRESHOLD_PCT:
             return 'ACTION_REBALANCE'
 
@@ -453,7 +508,18 @@ class DeltaNeutralLogic:
             net_delta = spot_qty + perp_qty  # perp_qty is negative for short
             total_size = max(abs(spot_qty), abs(perp_qty))
             imbalance_pct = abs(net_delta) / total_size * 100 if total_size > 0 else 0.0
-            is_delta_neutral = imbalance_pct <= 2.0  # 2% threshold for delta-neutral classification
+
+            # STRUCTURAL vs HEALTH. These were previously the same flag, and
+            # conflating them hid exactly the positions that needed attention:
+            # `is_delta_neutral` meant "imbalance <= 2%", and it gates both the
+            # health check and the UI's closeable list. So once a position drifted
+            # past 2% it silently vanished from monitoring AND could no longer be
+            # closed from the dashboard.
+            #
+            # `is_delta_neutral` now means "this is a DN position" (both legs
+            # present). `is_balanced` carries the health question separately.
+            has_both_legs = abs(spot_qty) > 1e-9 and abs(perp_qty) > 1e-9
+            is_balanced = imbalance_pct <= DELTA_NEUTRAL_TOLERANCE_PCT
 
             mark_price = float(position.get('markPrice', '0'))
             position_value_usd = abs(perp_qty) * mark_price
@@ -462,7 +528,8 @@ class DeltaNeutralLogic:
                 'symbol': symbol,
                 'spot_balance': spot_qty,
                 'perp_position': perp_qty,
-                'is_delta_neutral': is_delta_neutral,
+                'is_delta_neutral': has_both_legs,
+                'is_balanced': is_balanced,
                 'imbalance_pct': imbalance_pct,
                 'net_delta': net_delta,
                 'position_value_usd': position_value_usd,
@@ -484,7 +551,13 @@ class DeltaNeutralLogic:
         Returns:
             Tuple of (health_issues, critical_issues, dn_positions_count)
         """
-        # Filter for delta-neutral positions
+        # Filter for delta-neutral positions.
+        #
+        # This is now the STRUCTURAL flag (both legs present). It used to be
+        # "imbalance <= 2%", which made the imbalance warnings below unreachable:
+        # nothing that passed a <=2% filter can then be reported for being >5%.
+        # Those branches were dead code, and the positions they were meant to catch
+        # had already been filtered out.
         dn_positions = [p for p in positions_data if p.get('is_delta_neutral')]
         dn_positions_count = len(dn_positions)
 

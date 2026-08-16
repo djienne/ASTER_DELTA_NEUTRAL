@@ -9,7 +9,22 @@ import logging
 import urllib.parse
 import math
 from datetime import datetime
-from two_leg import LegStatus, classify_submission
+from two_leg import (
+    HaltedError,
+    LegSpec,
+    assert_not_halted,
+    execute_two_leg,
+)
+from funding_economics import (
+    VERIFIED_TAKER_BPS,
+    FundingInterval,
+    FundingIntervalResolver,
+    IntervalResolutionError,
+    TradeCostModel,
+    VenueCosts,
+    annualize,
+    evaluate_entry,
+)
 from decimal import Decimal
 from typing import Dict, List, Optional, Any, Tuple
 from web3 import Web3
@@ -22,6 +37,38 @@ from utils import truncate
 # Base URLs for the APIs
 FUTURES_BASE_URL = "https://fapi.asterdex.com"
 SPOT_BASE_URL = "https://sapi.asterdex.com"
+
+# Where the halt sentinel lives.
+#
+# It must survive a container restart, so it is written to a directory intended
+# to be a mounted volume rather than to the process's working directory. A halt
+# that evaporates on `docker compose up` defeats the entire mechanism: the whole
+# point is that the bot refuses to trade until a human has checked both legs.
+DATA_DIR = os.getenv(
+    "ASTER_DN_DATA_DIR",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "data"),
+)
+HALT_PATH = os.path.join(DATA_DIR, "halt.json")
+
+# Cost inputs for the entry gate.
+#
+# A full cycle is FOUR taker fills: buy spot + sell perp to open, then the reverse
+# to close. Break-even APR is roundtrip_pct * (8760 / hold_hours), so it scales as
+# 1/hold_hours -- which is why the hold length is the lever that matters and a
+# higher APR threshold alone is not. At the default 4bps taker + 2bps slippage the
+# round trip is 0.24%, so an 8h hold needs ~263% APR to break even while a 72h
+# hold needs ~29%.
+ASTER_SLIPPAGE_BPS = float(os.getenv("ASTER_DN_SLIPPAGE_BPS", "2.0"))
+DEFAULT_HOLD_HOURS = float(os.getenv("ASTER_DN_HOLD_HOURS", "72"))
+
+
+def aster_cost_model(slippage_bps: float = ASTER_SLIPPAGE_BPS) -> TradeCostModel:
+    """Round-trip cost across both legs of an Aster delta-neutral cycle."""
+    taker = VERIFIED_TAKER_BPS["aster"]
+    return TradeCostModel(legs=(
+        VenueCosts("aster-spot", taker_bps=taker, slippage_bps=slippage_bps),
+        VenueCosts("aster-perp", taker_bps=taker, slippage_bps=slippage_bps),
+    ))
 
 
 class AsterApiManager:
@@ -52,6 +99,12 @@ class AsterApiManager:
         self.session = None
         self.spot_exchange_info = None
         self.perp_exchange_info = None
+
+        # Per-symbol funding intervals. Aster runs 1h, 4h and 8h simultaneously,
+        # so a single hardcoded constant is wrong for most of the book.
+        self._interval_resolver = FundingIntervalResolver()
+        self._funding_info_cache: Optional[Dict[str, float]] = None
+        self._funding_info_fetched_at: float = 0.0
 
     # --- Ethereum Signature Methods (for Perpetuals API) ---
 
@@ -332,6 +385,139 @@ class AsterApiManager:
         }
         return await self._signed_perp_request('POST', '/fapi/v3/order', params)
 
+    # --- Order Sweeping (backs two_leg's LegSpec.cancel_open) ---
+    #
+    # The manager previously had no cancel capability at all. two_leg requires it:
+    # resting orders must be cancelled BEFORE a position is read back, otherwise a
+    # "stable zero fill" is not really zero - an untouched order can still fill
+    # later, and you will have concluded REJECTED about a leg that is about to go
+    # live. The DN path uses MARKET orders on both legs so this is usually a no-op,
+    # but it is the difference between "usually" and "provably".
+
+    async def get_open_perp_orders(self, symbol: str) -> List[Dict[str, Any]]:
+        """Open perpetual orders for `symbol`. Raises if the query fails."""
+        result = await self._signed_perp_request('GET', '/fapi/v3/openOrders', {'symbol': symbol})
+        return result if isinstance(result, list) else []
+
+    async def cancel_all_perp_orders(self, symbol: str) -> int:
+        """Cancel every open perp order for `symbol`. Returns how many were cancelled."""
+        open_orders = await self.get_open_perp_orders(symbol)
+        if not open_orders:
+            return 0
+        await self._signed_perp_request('DELETE', '/fapi/v3/allOpenOrders', {'symbol': symbol})
+        return len(open_orders)
+
+    async def get_open_spot_orders(self, symbol: str) -> List[Dict[str, Any]]:
+        """Open spot orders for `symbol`. Raises if the query fails."""
+        result = await self._make_spot_request(
+            'GET', '/api/v1/openOrders', params={'symbol': symbol}, signed=True
+        )
+        return result if isinstance(result, list) else []
+
+    async def cancel_all_spot_orders(self, symbol: str) -> int:
+        """Cancel every open spot order for `symbol`. Returns how many were cancelled.
+
+        The spot API has no bulk cancel (only `DELETE /api/v1/order` by orderId),
+        so this queries and cancels one at a time. A single failed cancel is logged
+        and skipped rather than aborting the sweep - cancelling three of four
+        resting orders is strictly better than cancelling none.
+        """
+        open_orders = await self.get_open_spot_orders(symbol)
+        cancelled = 0
+        for order in open_orders:
+            order_id = order.get('orderId')
+            if order_id is None:
+                continue
+            try:
+                await self._make_spot_request(
+                    'DELETE', '/api/v1/order',
+                    params={'symbol': symbol, 'orderId': order_id}, signed=True
+                )
+                cancelled += 1
+            except Exception as exc:  # noqa: BLE001
+                logging.warning("Failed to cancel spot order %s on %s: %s", order_id, symbol, exc)
+        return cancelled
+
+    # --- Position Reads (back two_leg's LegSpec.read_position) ---
+    #
+    # These MUST raise when the read fails and MUST NOT fall back to 0.0.
+    # verify_fill treats a returned number as ground truth, so a read that fails
+    # open to zero reports "nothing filled" / "position closed" about a leg that is
+    # actually live. That exact bug ("position read fails open to 0.0") is called
+    # out in two_leg.py's verify_fill docstring as how a leg got forgotten
+    # permanently. Absence from the response is different from a failed read: it
+    # genuinely means flat, and returning 0.0 for that case is correct.
+
+    async def get_perp_position_qty(self, symbol: str) -> float:
+        """Signed perp position size for `symbol` (negative = short). Raises on read failure."""
+        account = await self.get_perp_account_info()
+        if not isinstance(account, dict) or 'positions' not in account:
+            raise RuntimeError(
+                f"Perp account response for {symbol} has no 'positions' field; "
+                f"refusing to report a position size from an unrecognised payload."
+            )
+        for position in account.get('positions', []):
+            if position.get('symbol') == symbol:
+                return float(position.get('positionAmt', 0) or 0)
+        return 0.0
+
+    async def get_spot_base_qty(self, symbol: str) -> float:
+        """Spot balance of `symbol`'s base asset (free + locked). Raises on read failure.
+
+        Locked is included deliberately: a balance sitting in a resting order is
+        still owned, and excluding it would understate the hedge and trigger a
+        spurious top-up.
+        """
+        base_asset = await self._get_base_asset(symbol)
+        balances = await self.get_spot_account_balances()
+        if not isinstance(balances, list):
+            raise RuntimeError(
+                f"Spot balance response for {symbol} was {type(balances).__name__}, "
+                f"expected a list; refusing to report a balance from it."
+            )
+        total = 0.0
+        for balance in balances:
+            if balance.get('asset') == base_asset:
+                total += float(balance.get('free', 0) or 0)
+                total += float(balance.get('locked', 0) or 0)
+        return total
+
+    async def _get_base_asset(self, symbol: str) -> str:
+        """Base asset for `symbol`, from exchange info rather than string surgery."""
+        perp_info = await self._get_perp_exchange_info()
+        for entry in perp_info.get('symbols', []):
+            if entry.get('symbol') == symbol and entry.get('baseAsset'):
+                return entry['baseAsset']
+        spot_info = await self._get_spot_exchange_info()
+        for entry in spot_info.get('symbols', []):
+            if entry.get('symbol') == symbol and entry.get('baseAsset'):
+                return entry['baseAsset']
+        raise ValueError(f"Cannot determine base asset for {symbol} from exchange info.")
+
+    async def get_funding_info(self) -> Dict[str, float]:
+        """Map of symbol -> fundingIntervalHours from `GET /fapi/v1/fundingInfo`.
+
+        Aster runs 1h, 4h and 8h funding simultaneously across symbols, so this is
+        the difference between a correct APR and one that is silently 2x or 8x out.
+        The endpoint returns every symbol in a single public call. Symbols missing
+        from the response are simply absent from the map - the caller resolves
+        those empirically rather than assuming a default.
+        """
+        if not self.session:
+            self.session = aiohttp.ClientSession()
+        url = f"{FUTURES_BASE_URL}/fapi/v1/fundingInfo"
+        async with self.session.get(url) as response:
+            response.raise_for_status()
+            payload = await response.json()
+
+        intervals: Dict[str, float] = {}
+        for entry in payload or []:
+            symbol = entry.get('symbol')
+            hours = entry.get('fundingIntervalHours')
+            if symbol and hours:
+                intervals[symbol] = float(hours)
+        return intervals
+
     async def get_perp_leverage(self, symbol: str) -> int:
         """Get current leverage for a perpetual trading symbol."""
         # For testing compatibility, try both formats
@@ -503,6 +689,81 @@ class AsterApiManager:
             print(f"Error getting perp filter for {symbol}: {e}")
         return None
 
+    async def get_spot_symbol_filter(self, symbol: str, filter_type: str) -> Optional[Dict]:
+        """Retrieves a specific filter for a spot symbol from exchange info."""
+        try:
+            exchange_info = await self._get_spot_exchange_info()
+            symbol_info = next((s for s in exchange_info.get('symbols', []) if s['symbol'] == symbol), None)
+            if symbol_info:
+                return next((f for f in symbol_info.get('filters', []) if f['filterType'] == filter_type), None)
+        except Exception as e:
+            print(f"Error getting spot filter for {symbol}: {e}")
+        return None
+
+    @staticmethod
+    def _tick_from_filter(lot_size_filter: Optional[Dict], default: float = 0.0) -> float:
+        """stepSize out of a LOT_SIZE filter, as a float tick."""
+        if lot_size_filter and lot_size_filter.get('stepSize'):
+            try:
+                return float(lot_size_filter['stepSize'])
+            except (TypeError, ValueError):
+                pass
+        return default
+
+    def _build_perp_leg(self, symbol: str, side: str, qty: float, amount_tick: float,
+                        reduce_only: bool = False) -> LegSpec:
+        """LegSpec driving the perpetual side. All venue coupling lives here."""
+        api_side = side.upper()
+
+        async def submit(q: float):
+            if reduce_only:
+                return await self.close_perp_position(symbol, str(q), api_side)
+            return await self.place_perp_market_order(symbol, str(q), api_side)
+
+        async def close_market(q: float, close_side: str):
+            return await self.close_perp_position(symbol, str(q), close_side.upper())
+
+        return LegSpec(
+            name="Aster-perp", symbol=symbol, side=side, intent_qty=qty,
+            submit=submit,
+            read_position=lambda: self.get_perp_position_qty(symbol),
+            close_market=close_market,
+            cancel_open=lambda: self.cancel_all_perp_orders(symbol),
+            amount_tick=amount_tick,
+            settle_delay_s=1.0,
+        )
+
+    def _build_spot_leg(self, symbol: str, side: str, qty: float, amount_tick: float,
+                        price: float) -> LegSpec:
+        """LegSpec driving the spot side.
+
+        `intent_qty` is in BASE units so it is directly comparable with the perp
+        leg and with the balance that read_position returns. The quote conversion
+        for market BUYs happens inside submit(), because Aster's spot buy is
+        quoteOrderQty-denominated. The old code passed the USD notional straight
+        in as intent_qty, which made every tolerance and residual on this leg a
+        comparison between dollars and coins.
+        """
+        async def submit(q: float):
+            if side == "buy":
+                return await self.place_spot_buy_market_order(symbol, str(q * price))
+            return await self.place_spot_sell_market_order(symbol, str(q))
+
+        async def close_market(q: float, close_side: str):
+            if close_side.lower() == "buy":
+                return await self.place_spot_buy_market_order(symbol, str(q * price))
+            return await self.place_spot_sell_market_order(symbol, str(q))
+
+        return LegSpec(
+            name="Aster-spot", symbol=symbol, side=side, intent_qty=qty,
+            submit=submit,
+            read_position=lambda: self.get_spot_base_qty(symbol),
+            close_market=close_market,
+            cancel_open=lambda: self.cancel_all_spot_orders(symbol),
+            amount_tick=amount_tick,
+            settle_delay_s=1.0,
+        )
+
     async def discover_delta_neutral_pairs(self) -> List[str]:
         """Dynamically discover which pairs are available for delta-neutral strategies."""
         try:
@@ -568,8 +829,47 @@ class AsterApiManager:
             print(f"Error analyzing positions: {e}")
             return {}
 
+    async def _get_funding_info_cached(self, ttl_s: float = 6 * 3600.0) -> Dict[str, float]:
+        """`get_funding_info()` behind a TTL cache; one call covers every symbol."""
+        now = time.time()
+        if (self._funding_info_cache is None
+                or (now - self._funding_info_fetched_at) > ttl_s):
+            self._funding_info_cache = await self.get_funding_info()
+            self._funding_info_fetched_at = now
+        return self._funding_info_cache
+
+    async def resolve_funding_interval(self, symbol: str) -> FundingInterval:
+        """Funding interval for `symbol`. Raises IntervalResolutionError if unknown.
+
+        Preferred source is the venue's own `fundingIntervalHours`. If the symbol
+        is absent from that response the interval is inferred from the spacing of
+        its actual settlement timestamps. If both fail the caller MUST skip the
+        symbol: annualizing on a guessed constant is what made a 4h symbol's APR
+        read at half its true value and rank below worse opportunities.
+        """
+        async def from_api_field(sym: str) -> Optional[float]:
+            info = await self._get_funding_info_cached()
+            return info.get(sym)
+
+        try:
+            return await self._interval_resolver.resolve_from_api_field(
+                'aster', symbol, from_api_field)
+        except IntervalResolutionError:
+            async def funding_times(sym: str) -> List[int]:
+                history = await self.get_funding_rate_history(sym, limit=20)
+                return [int(h['fundingTime']) for h in history if h.get('fundingTime')]
+
+            return await self._interval_resolver.resolve_empirically(
+                'aster', symbol, funding_times)
+
     async def get_all_funding_rates(self) -> List[Dict[str, Any]]:
-        """Fetches and returns funding rates for all available delta-neutral pairs."""
+        """Funding rates and correctly annualized APRs for all delta-neutral pairs.
+
+        The APR used to be `rate * 3 * 365 * 100`, i.e. a hardcoded 8h interval.
+        Aster runs 1h, 4h and 8h intervals simultaneously, so that understated a
+        4h symbol by 2x and a 1h symbol by 8x -- and this table is what the
+        operator picks from, so the mis-ranking directly selected worse trades.
+        """
         symbols_to_scan = await self.discover_delta_neutral_pairs()
         if not symbols_to_scan:
             return []
@@ -580,11 +880,26 @@ class AsterApiManager:
         funding_data = []
         for i, symbol in enumerate(symbols_to_scan):
             rate_data = rate_results[i]
-            if not isinstance(rate_data, Exception) and rate_data:
-                rate = float(rate_data[0].get('fundingRate', 0))
-                apr = rate * 3 * 365 * 100
-                funding_data.append({'symbol': symbol, 'rate': rate, 'apr': apr})
-        
+            if isinstance(rate_data, Exception) or not rate_data:
+                continue
+
+            rate = float(rate_data[0].get('fundingRate', 0))
+            try:
+                interval = await self.resolve_funding_interval(symbol)
+            except IntervalResolutionError as exc:
+                # Skip rather than guess. A row missing from the table is far
+                # cheaper than a row with a silently wrong APR next to it.
+                logging.warning("Skipping %s: %s", symbol, exc)
+                continue
+
+            funding_data.append({
+                'symbol': symbol,
+                'rate': rate,
+                'apr': annualize(rate, interval),
+                'interval_hours': interval.hours,
+                'interval_source': interval.source,
+            })
+
         # Sort by highest APR
         return sorted(funding_data, key=lambda x: x['apr'], reverse=True)
 
@@ -657,14 +972,35 @@ class AsterApiManager:
             'analyzed_positions': analyzed_positions,
         }
 
-    async def prepare_and_execute_dn_position(self, symbol: str, capital_to_deploy: float, dry_run: bool = False) -> Dict[str, Any]:
-        """Prepares and (optionally) executes a delta-neutral position opening."""
+    async def prepare_and_execute_dn_position(
+        self, symbol: str, capital_to_deploy: float, dry_run: bool = False,
+        hold_hours: float = DEFAULT_HOLD_HOURS,
+        allow_negative_carry: bool = False,
+    ) -> Dict[str, Any]:
+        """Prepares and (optionally) executes a delta-neutral position opening.
+
+        `hold_hours` is how long you intend to hold. It is not cosmetic: break-even
+        APR scales as 1/hold_hours, so it decides whether a cycle can pay for its
+        own four taker fills at all.
+
+        `allow_negative_carry=True` opens anyway when the fee-aware gate rejects.
+        Reserved for the operator explicitly overriding, never a default.
+        """
         trade_details = {'success': False, 'message': '', 'details': None}
         try:
+            # Refuse to trade while a halt sentinel is present. Checked here as
+            # well as inside execute_two_leg so that a halted bot does not spend
+            # a round of API calls building a plan it will never be allowed to run.
+            if not dry_run:
+                assert_not_halted(HALT_PATH)
+
             # 1. Fetch required data
-            spot_price_data, lot_size_filter, spot_balances, perp_account = await asyncio.gather(
+            (spot_price_data, lot_size_filter, spot_lot_filter,
+             spot_notional_filter, spot_balances, perp_account) = await asyncio.gather(
                 self.get_spot_book_ticker(symbol),
                 self.get_perp_symbol_filter(symbol, 'LOT_SIZE'),
+                self.get_spot_symbol_filter(symbol, 'LOT_SIZE'),
+                self.get_spot_symbol_filter(symbol, 'MIN_NOTIONAL'),
                 self.get_spot_account_balances(),
                 self.get_perp_account_info()
             )
@@ -684,8 +1020,17 @@ class AsterApiManager:
                 return trade_details
 
             # 3. Calculate position sizes
-            base_asset = symbol.replace('USDT', '')
-            existing_spot_quantity = sum(float(b.get('free', '0')) for b in spot_balances if b.get('asset') == base_asset)
+            #
+            # free + locked, and the base asset comes from exchange info rather
+            # than stripping "USDT" off the symbol. Both details matter because
+            # this number is compared against what the spot leg's read_position()
+            # reports during fill verification -- if the two are measured
+            # differently, a correctly hedged position looks imbalanced.
+            base_asset = await self._get_base_asset(symbol)
+            existing_spot_quantity = sum(
+                float(b.get('free', '0') or 0) + float(b.get('locked', '0') or 0)
+                for b in spot_balances if b.get('asset') == base_asset
+            )
             sizing = DeltaNeutralLogic.calculate_position_size(
                 total_usd_capital=capital_to_deploy,
                 spot_price=spot_price,
@@ -720,77 +1065,148 @@ class AsterApiManager:
                 'spot_qty_to_buy': spot_qty_to_buy,
                 'spot_capital_to_buy': spot_capital_to_buy
             }
+            # 6b. FEE-AWARE ENTRY GATE.
+            #
+            # The only entry filter before this was ANNUALIZED_APR_THRESHOLD = 15%,
+            # a GROSS number with no cost term anywhere. A cycle here pays four
+            # taker fills, so at a short hold the break-even APR runs into the
+            # hundreds of percent and a 15% gate admits systematically losing
+            # trades. This computes the actual expected net in dollars.
+            entry_decision = None
+            try:
+                interval = await self.resolve_funding_interval(symbol)
+                rate_history = await self.get_funding_rate_history(symbol, limit=1)
+                if rate_history:
+                    funding_rate = float(rate_history[0].get('fundingRate', 0))
+                    gross_apr = annualize(funding_rate, interval)
+                    entry_decision = evaluate_entry(
+                        symbol=symbol,
+                        gross_net_apr_pct=gross_apr,
+                        notional_usd=float(final_perp_qty) * spot_price,
+                        hold_hours=hold_hours,
+                        cost=aster_cost_model(),
+                    )
+                    details['funding_interval_hours'] = interval.hours
+                    details['funding_apr_pct'] = gross_apr
+                    details['hold_hours'] = hold_hours
+                    details['break_even_apr_pct'] = entry_decision.break_even_apr_pct
+                    details['expected_net_usd'] = entry_decision.expected_net_usd
+                    details['entry_reason'] = entry_decision.reason
+            except IntervalResolutionError as exc:
+                # No interval means no trustworthy APR, so no trustworthy decision.
+                details['entry_reason'] = f"funding interval unresolved: {exc}"
+
             trade_details['details'] = details
+
+            if (entry_decision is not None and not entry_decision.accept
+                    and not allow_negative_carry):
+                trade_details['message'] = (
+                    f"Refusing to open {symbol}: {entry_decision.reason}. "
+                    f"At a {hold_hours:g}h hold this cycle needs "
+                    f"{entry_decision.break_even_apr_pct:.1f}% APR to cover its four "
+                    f"taker fills; expected net is "
+                    f"${entry_decision.expected_net_usd:.2f}. Hold longer, size up, "
+                    f"or pass allow_negative_carry=True to override. Nothing was "
+                    f"submitted."
+                )
+                trade_details['entry_decision'] = entry_decision
+                return trade_details
+
+            # 7. PRE-SUBMISSION GATE.
+            #
+            # This check used to run AFTER both orders had been fired: the gather
+            # below submitted the perp SELL unconditionally and substituted
+            # asyncio.sleep(0) for the spot BUY when the notional was under $1,
+            # then appended "the perp leg would be unhedged" to the failure list.
+            # It deliberately opened a naked short and then reported the problem.
+            #
+            # It was also wrong in the ordinary case: spot_qty_to_buy is correctly
+            # zero when existing spot already covers the hedge, which is a properly
+            # hedged position, not a failure.
+            spot_tick = self._tick_from_filter(spot_lot_filter)
+            hedge_already_covered = spot_qty_to_buy <= max(spot_tick, 1e-12)
+
+            if not hedge_already_covered:
+                min_notional = 0.0
+                if spot_notional_filter:
+                    min_notional = float(
+                        spot_notional_filter.get('minNotional')
+                        or spot_notional_filter.get('notional')
+                        or 0.0
+                    )
+                if spot_capital_to_buy < min_notional:
+                    trade_details['message'] = (
+                        f"Refusing to open {symbol}: the spot hedge would be "
+                        f"${spot_capital_to_buy:.2f}, below the exchange minimum of "
+                        f"${min_notional:.2f}. Opening the perp leg alone would leave a "
+                        f"naked short. Nothing was submitted. Increase the capital to "
+                        f"deploy, or reduce it so no perp leg is opened either."
+                    )
+                    return trade_details
 
             if dry_run:
                 trade_details['success'] = True
                 trade_details['message'] = "Dry run successful. Trade details calculated."
                 return trade_details
 
-            # 7. Execute trades
-            exec_results = await asyncio.gather(
-                self.place_perp_market_order(symbol, str(final_perp_qty), 'SELL'),
-                self.place_spot_buy_market_order(symbol, str(spot_capital_to_buy)) if spot_capital_to_buy > 1.0 else asyncio.sleep(0),
-                return_exceptions=True
-            )
-
-            perp_result, spot_result = exec_results
-            trade_details['perp_order'] = perp_result
-            trade_details['spot_order'] = spot_result
-
-            # Inspect BOTH results before claiming success.
+            # 8. Execute: perp is the pilot, spot is the hedge.
             #
-            # This block used to set success=True and "Successfully opened position"
-            # unconditionally, without ever looking at perp_result/spot_result. With
-            # return_exceptions=True a rejected leg arrives as a value, not a raise,
-            # so a perp SELL that filled alongside a spot BUY that was rejected
-            # (429 / -1013 / insufficient balance) was reported as a healthy hedge.
-            # The bot then held a NAKED SHORT while its dashboard showed green.
-            perp_res = classify_submission(
-                "Aster-perp", perp_result, intent_qty=float(final_perp_qty),
-                symbol=symbol, side="sell",
+            # Sequential, not asyncio.gather. Parallel submission maximises the
+            # window in which both legs are live and unverified, and makes the
+            # failure case undecidable. More importantly, the hedge is now sized
+            # from what the perp ACTUALLY filled rather than from a pre-trade
+            # bidPrice estimate, and every leg is confirmed by reading the position
+            # back -- acceptance is not a fill.
+            perp_tick = self._tick_from_filter(lot_size_filter)
+            pilot = self._build_perp_leg(symbol, "sell", float(final_perp_qty), perp_tick)
+            hedge = self._build_spot_leg(symbol, "buy", float(spot_qty_to_buy),
+                                         spot_tick, spot_price)
+
+            # Existing spot counts toward the hedge, so only the shortfall is
+            # bought. Returning ~0 tells execute_two_leg the hedge is already held.
+            def hedge_qty_from_pilot(perp_filled: float) -> float:
+                return max(0.0, perp_filled - existing_spot_quantity)
+
+            outcome = await execute_two_leg(
+                pilot, hedge,
+                min_notional_qty=0.0,
+                halt_path=HALT_PATH,
+                hedge_qty_from_pilot=hedge_qty_from_pilot,
             )
-            spot_skipped = not (spot_capital_to_buy > 1.0)
-            spot_res = classify_submission(
-                "Aster-spot", spot_result, intent_qty=float(spot_capital_to_buy),
-                symbol=symbol, side="buy",
-            ) if not spot_skipped else None
 
-            failures = []
-            if perp_res.status is LegStatus.REJECTED:
-                failures.append(f"perp: {perp_res.error}")
-            if spot_res is not None and spot_res.status is LegStatus.REJECTED:
-                failures.append(f"spot: {spot_res.error}")
+            trade_details['success'] = outcome.ok
+            trade_details['halted'] = outcome.halted
+            trade_details['hedged_qty'] = outcome.hedged_qty
+            trade_details['notes'] = outcome.notes
+            trade_details['leg_status'] = {
+                'perp': outcome.pilot.status.value if outcome.pilot else 'not submitted',
+                'spot': outcome.hedge.status.value if outcome.hedge else 'not submitted',
+            }
+            trade_details['perp_order'] = outcome.pilot.raw if outcome.pilot else None
+            trade_details['spot_order'] = outcome.hedge.raw if outcome.hedge else None
 
-            if spot_skipped:
-                # The spot leg was never attempted because the notional was under
-                # $1. That is NOT a delta-neutral position - it is a naked short.
-                failures.append(
-                    f"spot leg skipped (capital ${spot_capital_to_buy:.2f} <= $1.00); "
-                    f"the perp leg would be unhedged"
-                )
-
-            if failures:
-                trade_details['success'] = False
+            if outcome.ok:
                 trade_details['message'] = (
-                    f"FAILED to open delta-neutral position for {symbol}: "
-                    + "; ".join(failures)
-                    + ". WARNING: any leg that DID fill is now unhedged - verify and "
-                      "flatten manually before retrying."
+                    f"Opened {symbol} delta-neutral: {outcome.hedged_qty:.8f} confirmed "
+                    f"hedged on both legs ({outcome.reason})."
                 )
-                trade_details['leg_status'] = {
-                    'perp': perp_res.status.value,
-                    'spot': spot_res.status.value if spot_res else 'skipped',
-                }
-                return trade_details
-
-            trade_details['success'] = True
-            trade_details['message'] = (
-                f"Both legs accepted for {symbol}. Verify fills before treating this "
-                f"as hedged - acceptance is not a fill."
-            )
+            elif outcome.halted:
+                trade_details['message'] = (
+                    f"HALTED opening {symbol}: {outcome.reason}. A halt sentinel was "
+                    f"written to {HALT_PATH} and the bot will refuse to trade until it "
+                    f"is removed. Check BOTH legs on the exchange before clearing it."
+                )
+            else:
+                trade_details['message'] = (
+                    f"Did not open {symbol}: {outcome.reason}. Any leg that filled has "
+                    f"been unwound."
+                )
             return trade_details
 
+        except HaltedError as e:
+            trade_details['halted'] = True
+            trade_details['message'] = str(e)
+            return trade_details
         except Exception as e:
             trade_details['message'] = f"Failed to open position: {e}"
             return trade_details
@@ -840,55 +1256,76 @@ class AsterApiManager:
                     float(spot_balance) - spot_quantity,
                 )
 
-            # 3. Execute closing trades
-            exec_results = await asyncio.gather(
-                self.close_perp_position(symbol, str(perp_quantity), side_to_close),
-                self.place_spot_sell_market_order(symbol, str(spot_quantity)),
-                return_exceptions=True
+            # 3. Execute closing trades: perp reduce-only is the pilot, spot the hedge.
+            #
+            # Same reasoning as the open path. Previously both closes went out via
+            # asyncio.gather and only REJECTED was treated as failure, so a close
+            # whose outcome was UNKNOWN (timeout, dropped connection) reported
+            # success -- the bot then moved on and cleared its state while a leg was
+            # still live, leaving a position with no monitoring and nothing
+            # recording that it existed.
+            perp_lot_filter, spot_lot_filter, spot_price_data = await asyncio.gather(
+                self.get_perp_symbol_filter(symbol, 'LOT_SIZE'),
+                self.get_spot_symbol_filter(symbol, 'LOT_SIZE'),
+                self.get_spot_book_ticker(symbol),
+            )
+            spot_price = float(spot_price_data['bidPrice'])
+
+            pilot = self._build_perp_leg(
+                symbol, side_to_close.lower(), float(perp_quantity),
+                self._tick_from_filter(perp_lot_filter), reduce_only=True,
+            )
+            hedge = self._build_spot_leg(
+                symbol, "sell", float(spot_quantity),
+                self._tick_from_filter(spot_lot_filter), spot_price,
             )
 
-            perp_result, spot_result = exec_results
-            close_details['perp_order'] = perp_result
-            close_details['spot_order'] = spot_result
+            # Sell exactly as much spot as the perp actually reduced, capped at the
+            # hedge size. Without the cap a larger long-term spot holding would be
+            # market-sold along with the hedge.
+            def hedge_qty_from_pilot(perp_closed: float) -> float:
+                return min(float(spot_quantity), perp_closed)
 
-            # Mirror of the open path: inspect both results. Unconditional success
-            # here meant a failed close left a live leg while the bot moved on and
-            # cleared its state - the position then had no stop-loss, no monitoring
-            # and nothing recording that it existed.
-            perp_res = classify_submission(
-                "Aster-perp", perp_result, intent_qty=float(perp_quantity),
-                symbol=symbol, side=side_to_close.lower(),
-            )
-            spot_res = classify_submission(
-                "Aster-spot", spot_result, intent_qty=float(spot_quantity),
-                symbol=symbol, side="sell",
+            outcome = await execute_two_leg(
+                pilot, hedge,
+                min_notional_qty=0.0,
+                halt_path=HALT_PATH,
+                hedge_qty_from_pilot=hedge_qty_from_pilot,
             )
 
-            failures = []
-            if perp_res.status is LegStatus.REJECTED:
-                failures.append(f"perp: {perp_res.error}")
-            if spot_res.status is LegStatus.REJECTED:
-                failures.append(f"spot: {spot_res.error}")
+            close_details['success'] = outcome.ok
+            close_details['halted'] = outcome.halted
+            close_details['closed_qty'] = outcome.hedged_qty
+            close_details['notes'] = outcome.notes
+            close_details['leg_status'] = {
+                'perp': outcome.pilot.status.value if outcome.pilot else 'not submitted',
+                'spot': outcome.hedge.status.value if outcome.hedge else 'not submitted',
+            }
+            close_details['perp_order'] = outcome.pilot.raw if outcome.pilot else None
+            close_details['spot_order'] = outcome.hedge.raw if outcome.hedge else None
 
-            if failures:
-                close_details['success'] = False
+            if outcome.ok:
                 close_details['message'] = (
-                    f"FAILED to close position for {symbol}: " + "; ".join(failures)
-                    + ". The position is STILL OPEN - do not clear it from state. "
-                      "Verify both legs on the exchange."
+                    f"Closed {symbol}: {outcome.hedged_qty:.8f} confirmed reduced on "
+                    f"both legs ({outcome.reason})."
                 )
-                close_details['leg_status'] = {
-                    'perp': perp_res.status.value, 'spot': spot_res.status.value,
-                }
-                return close_details
-
-            close_details['success'] = True
-            close_details['message'] = (
-                f"Both close legs accepted for {symbol}. Verify flat before treating "
-                f"this position as closed."
-            )
+            elif outcome.halted:
+                close_details['message'] = (
+                    f"HALTED closing {symbol}: {outcome.reason}. A halt sentinel was "
+                    f"written to {HALT_PATH}. The position may be PARTLY OPEN - do not "
+                    f"clear it from state. Verify both legs before clearing the halt."
+                )
+            else:
+                close_details['message'] = (
+                    f"FAILED to close {symbol}: {outcome.reason}. The position is STILL "
+                    f"OPEN - do not clear it from state. Verify both legs on the exchange."
+                )
             return close_details
 
+        except HaltedError as e:
+            close_details['halted'] = True
+            close_details['message'] = str(e)
+            return close_details
         except Exception as e:
             close_details['message'] = f"Failed to close position: {e}"
             return close_details

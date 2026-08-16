@@ -22,8 +22,9 @@ except ImportError:
     import termios
     import tty
 
-from aster_api_manager import AsterApiManager
+from aster_api_manager import DEFAULT_HOLD_HOURS, HALT_PATH, AsterApiManager
 from strategy_logic import DeltaNeutralLogic
+from two_leg import read_halt
 from utils import truncate
 
 # Import rendering functions from ui_renderers
@@ -881,6 +882,12 @@ def main():
     parser.add_argument('--close', nargs='?', const=True, default=None, help="Close a delta-neutral position. Runs interactively if no symbol is provided.")
     parser.add_argument('--analyze-fundings', nargs='?', const=True, default=None, help="Analyze paid fundings for a delta-neutral position. Runs interactively if no symbol is provided.")
     parser.add_argument('--yes', action='store_true', help="Bypass confirmation for non-interactive commands like --open.")
+    parser.add_argument('--hold-hours', type=float, default=DEFAULT_HOLD_HOURS,
+                        help=f"Intended hold length in hours (default {DEFAULT_HOLD_HOURS:g}). "
+                             "Break-even APR scales as 1/hold, so this decides whether a "
+                             "cycle can cover its four taker fills.")
+    parser.add_argument('--allow-negative-carry', action='store_true',
+                        help="Open even when the fee-aware gate says the cycle loses money.")
     args = parser.parse_args()
 
     # Check for required environment variables
@@ -889,6 +896,22 @@ def main():
         print(Fore.RED + "ERROR: Not all required environment variables are set in your .env file." + Style.RESET_ALL)
         print("Please ensure API_USER, API_SIGNER, API_PRIVATE_KEY, APIV1_PUBLIC_KEY, and APIV1_PRIVATE_KEY are configured.")
         sys.exit(1)
+
+    # A halt sentinel means a previous cycle left real, unhedged, unmanaged
+    # exposure that a human has not yet cleared. Surface it at startup rather than
+    # at the moment someone tries to trade, and keep the read-only commands
+    # working so the operator can actually inspect the damage.
+    halt = read_halt(HALT_PATH)
+    if halt is not None:
+        print(Fore.RED + "=" * 78)
+        print("HALTED - this bot will refuse to open or close positions.")
+        print("=" * 78 + Style.RESET_ALL)
+        print(f"  reason:     {halt.get('reason')}")
+        print(f"  venue:      {halt.get('venue')}   symbol: {halt.get('symbol')}")
+        print(f"  residual:   {halt.get('residual_qty')}")
+        print(f"  written at: {halt.get('written_at')}")
+        print(f"\nCheck BOTH legs on the exchange, then delete {HALT_PATH} to resume.")
+        print("Read-only commands still work.\n")
 
     # Handle CLI-only operations
     if args.pairs:
@@ -945,7 +968,10 @@ def main():
             # Non-interactive CLI mode
             try:
                 symbol, capital = args.open
-                asyncio.run(open_position_cli(symbol, float(capital), args.yes))
+                asyncio.run(open_position_cli(
+                    symbol, float(capital), args.yes,
+                    hold_hours=args.hold_hours,
+                    allow_negative_carry=args.allow_negative_carry))
             except (ValueError, IndexError):
                 print(f"{Fore.RED}Error: --open requires SYMBOL and CAPITAL arguments.{Style.RESET_ALL}")
             except KeyboardInterrupt:

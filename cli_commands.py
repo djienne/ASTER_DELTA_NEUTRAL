@@ -7,7 +7,7 @@ Contains standalone command-line interface functions.
 import os
 import asyncio
 from colorama import Fore, Style
-from aster_api_manager import AsterApiManager
+from aster_api_manager import DEFAULT_HOLD_HOURS, AsterApiManager
 from ui_renderers import (
     render_funding_rates_table,
     render_perpetual_positions_table,
@@ -388,7 +388,9 @@ async def rebalance_usdt_cli():
         await api_manager.close()
 
 
-async def open_position_cli(symbol: str, capital: float, auto_confirm: bool = False):
+async def open_position_cli(symbol: str, capital: float, auto_confirm: bool = False,
+                            hold_hours: float = DEFAULT_HOLD_HOURS,
+                            allow_negative_carry: bool = False):
     """CLI function to open a new delta-neutral position."""
     print(Fore.CYAN + f"Attempting to open a ${capital:.2f} USD position for {symbol}..." + Style.RESET_ALL)
 
@@ -403,7 +405,9 @@ async def open_position_cli(symbol: str, capital: float, auto_confirm: bool = Fa
     try:
         # 1. Perform Dry Run to get trade details
         print("Calculating trade details (dry run)...")
-        trade_plan = await api_manager.prepare_and_execute_dn_position(symbol, capital, dry_run=True)
+        trade_plan = await api_manager.prepare_and_execute_dn_position(
+            symbol, capital, dry_run=True,
+            hold_hours=hold_hours, allow_negative_carry=allow_negative_carry)
 
         if not trade_plan.get('success'):
             error_message = trade_plan.get('message', 'No error message provided.')
@@ -424,6 +428,19 @@ async def open_position_cli(symbol: str, capital: float, auto_confirm: bool = Fa
         print(f"Spot BUY Qty: {details['spot_qty_to_buy']:.8f} (${details['spot_capital_to_buy']:.2f})")
         print(f"Perp SELL Qty: {details['final_perp_qty']:.8f} (${details['final_perp_qty'] * details['spot_price']:.2f})")
 
+        # Economics. Break-even scales as 1/hold_hours, so the hold length is shown
+        # alongside it -- a rate that loses money over 8h can be fine over 72h.
+        if 'break_even_apr_pct' in details:
+            print("-" * 40)
+            print(f"Funding Interval: {details['funding_interval_hours']:g}h"
+                  f"   Funding APR: {details['funding_apr_pct']:.2f}%")
+            print(f"Assumed Hold:     {details['hold_hours']:g}h"
+                  f"   Break-even APR: {details['break_even_apr_pct']:.2f}%")
+            net = details['expected_net_usd']
+            net_color = Fore.GREEN if net >= 0 else Fore.RED
+            print(f"Expected Net:     {net_color}${net:.2f}{Style.RESET_ALL}"
+                  f"  ({details.get('entry_reason', '')})")
+
         # 3. Confirm and Execute
         if not auto_confirm:
             confirm = input("\nPress Enter to confirm (or enter 'x' to cancel): ")
@@ -432,7 +449,9 @@ async def open_position_cli(symbol: str, capital: float, auto_confirm: bool = Fa
                 return
 
         print("\nExecuting trades...")
-        exec_result = await api_manager.prepare_and_execute_dn_position(symbol, capital, dry_run=False)
+        exec_result = await api_manager.prepare_and_execute_dn_position(
+            symbol, capital, dry_run=False,
+            hold_hours=hold_hours, allow_negative_carry=allow_negative_carry)
 
         if exec_result.get('success'):
             print(f"{Fore.GREEN}{exec_result.get('message')}{Style.RESET_ALL}")

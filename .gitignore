@@ -26,3 +26,9 @@ Thumbs.db
 *.zip
 test1.png
 test2.png
+
+# Runtime state. halt.json records live unhedged exposure for a specific account
+# and must never be committed or shared.
+data/
+halt.json
+.pytest_cache/

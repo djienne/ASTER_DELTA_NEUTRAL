@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """
 Test suite for CLI functionality in delta_neutral_bot.py
 """
@@ -15,12 +15,50 @@ import argparse
 # Add current directory to path for imports
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from delta_neutral_bot import check_available_pairs, check_funding_rates, check_current_positions, check_spot_assets, check_futures_positions, main
+from delta_neutral_bot import check_available_pairs, check_funding_rates, check_current_positions, check_spot_assets, check_perpetual_positions, main
 from aster_api_manager import AsterApiManager
 
 
-class TestDeltaNeutralBotCLI(unittest.TestCase):
-    """Test CLI functionality of the delta-neutral bot."""
+def sample_portfolio_payload():
+    """The shape get_comprehensive_portfolio_data() returns.
+
+    `is_delta_neutral` is the STRUCTURAL flag (both legs present); `is_balanced`
+    is the separate health question. They used to be one flag, which made a
+    drifted position vanish from both the health check and the closeable list.
+    """
+    return {
+        'perp_account_info': {
+            'assets': [
+                {'asset': 'USDT', 'walletBalance': '5000.0'},
+                {'asset': 'USDC', 'walletBalance': '0.0'},
+                {'asset': 'USDF', 'walletBalance': '0.0'},
+            ]
+        },
+        'raw_perp_positions': [
+            {'symbol': 'BTCUSDT', 'positionAmt': '-0.5', 'markPrice': '30000.0',
+             'unrealizedProfit': '12.5', 'liquidationPrice': '0', 'leverage': '1'},
+        ],
+        'spot_balances': [
+            {'asset': 'USDT', 'free': '1000.0', 'locked': '0.0'},
+            {'asset': 'BTC', 'free': '0.5', 'locked': '0.0'},
+        ],
+        'analyzed_positions': [
+            {'symbol': 'BTCUSDT', 'spot_balance': 0.5, 'perp_position': -0.5,
+             'is_delta_neutral': True, 'is_balanced': True, 'imbalance_pct': 0.0,
+             'net_delta': 0.0, 'position_value_usd': 15000.0, 'leverage': 1},
+        ],
+    }
+
+
+class TestDeltaNeutralBotCLI(unittest.IsolatedAsyncioTestCase):
+    """Test CLI functionality of the delta-neutral bot.
+
+    IsolatedAsyncioTestCase, not TestCase. As a plain TestCase the `async def`
+    tests below were collected, called, and handed back a coroutine that was never
+    awaited -- so they reported PASS without executing a single assertion. The
+    separate TestAsyncRunner class existed to work around that by driving five of
+    them by hand; it is gone now that the async tests run properly here.
+    """
 
     def setUp(self):
         """Set up test environment with mocked API manager."""
@@ -35,7 +73,7 @@ class TestDeltaNeutralBotCLI(unittest.TestCase):
             'APIV1_PRIVATE_KEY': 'test_private_key'
         }
 
-    @patch('delta_neutral_bot.AsterApiManager')
+    @patch('cli_commands.AsterApiManager')
     @patch('os.getenv')
     async def test_check_available_pairs_success(self, mock_getenv, mock_api_manager_class):
         """Test successful pair discovery via CLI."""
@@ -44,9 +82,10 @@ class TestDeltaNeutralBotCLI(unittest.TestCase):
         mock_api_instance = AsyncMock()
         mock_api_manager_class.return_value = mock_api_instance
 
-        # Mock API responses
-        mock_api_instance.get_available_spot_symbols.return_value = ['BTCUSDT', 'ETHUSDT', 'ASTERUSDT']
-        mock_api_instance.get_available_perp_symbols.return_value = ['BTCUSDT', 'ETHUSDT', 'SOLUSDT']
+        # The intersection is computed inside discover_delta_neutral_pairs(); this
+        # test used to mock get_available_spot_symbols/get_available_perp_symbols,
+        # which check_available_pairs has not called since the CLI refactor.
+        mock_api_instance.discover_delta_neutral_pairs.return_value = ['BTCUSDT', 'ETHUSDT']
         mock_api_instance.close = AsyncMock()
 
         # Capture output
@@ -54,19 +93,16 @@ class TestDeltaNeutralBotCLI(unittest.TestCase):
             await check_available_pairs()
 
         # Verify API calls
-        mock_api_instance.get_available_spot_symbols.assert_called_once()
-        mock_api_instance.get_available_perp_symbols.assert_called_once()
+        mock_api_instance.discover_delta_neutral_pairs.assert_called_once()
         mock_api_instance.close.assert_called_once()
 
-        # Verify output contains expected pairs (intersection: BTCUSDT, ETHUSDT)
-        print_calls = [call[0][0] for call in mock_print.call_args_list]
-        output_text = ' '.join(print_calls)
+        # Verify output contains the discovered pairs
+        print_calls = [call[0][0] for call in mock_print.call_args_list if call[0]]
+        output_text = ' '.join(str(c) for c in print_calls)
         self.assertIn('BTCUSDT', output_text)
         self.assertIn('ETHUSDT', output_text)
-        self.assertNotIn('ASTERUSDT', output_text)  # Only in spot
-        self.assertNotIn('SOLUSDT', output_text)    # Only in perp
 
-    @patch('delta_neutral_bot.AsterApiManager')
+    @patch('cli_commands.AsterApiManager')
     @patch('os.getenv')
     async def test_check_available_pairs_empty_intersection(self, mock_getenv, mock_api_manager_class):
         """Test pair discovery when no pairs are available in both markets."""
@@ -75,9 +111,8 @@ class TestDeltaNeutralBotCLI(unittest.TestCase):
         mock_api_instance = AsyncMock()
         mock_api_manager_class.return_value = mock_api_instance
 
-        # Mock API responses with no intersection
-        mock_api_instance.get_available_spot_symbols.return_value = ['BTCUSDT', 'ETHUSDT']
-        mock_api_instance.get_available_perp_symbols.return_value = ['SOLUSDT', 'ADAUSDT']
+        # No pairs available in both markets.
+        mock_api_instance.discover_delta_neutral_pairs.return_value = []
         mock_api_instance.close = AsyncMock()
 
         # Capture output
@@ -85,11 +120,11 @@ class TestDeltaNeutralBotCLI(unittest.TestCase):
             await check_available_pairs()
 
         # Verify warning message
-        print_calls = [call[0][0] for call in mock_print.call_args_list]
-        output_text = ' '.join(print_calls)
+        print_calls = [call[0][0] for call in mock_print.call_args_list if call[0]]
+        output_text = ' '.join(str(c) for c in print_calls)
         self.assertIn('No symbols are currently available', output_text)
 
-    @patch('delta_neutral_bot.AsterApiManager')
+    @patch('cli_commands.AsterApiManager')
     @patch('os.getenv')
     async def test_check_funding_rates_success(self, mock_getenv, mock_api_manager_class):
         """Test successful funding rate fetching via CLI."""
@@ -98,14 +133,14 @@ class TestDeltaNeutralBotCLI(unittest.TestCase):
         mock_api_instance = AsyncMock()
         mock_api_manager_class.return_value = mock_api_instance
 
-        # Mock API responses
-        mock_api_instance.get_available_spot_symbols.return_value = ['BTCUSDT', 'ETHUSDT']
-        mock_api_instance.get_available_perp_symbols.return_value = ['BTCUSDT', 'ETHUSDT']
-
-        # Mock funding rate responses
-        mock_api_instance.get_funding_rate_history.side_effect = [
-            [{'fundingRate': '0.0001'}],  # BTC: 0.01% = ~10.95% APR
-            [{'fundingRate': '-0.0002'}]  # ETH: -0.02% = ~-21.9% APR
+        # Discovery, rate fetching and annualization all happen inside
+        # get_all_funding_rates(). Each row now also carries the funding interval,
+        # because Aster runs 1h/4h/8h simultaneously and the APR depends on it.
+        mock_api_instance.get_all_funding_rates.return_value = [
+            {'symbol': 'BTCUSDT', 'rate': 0.0001, 'apr': 10.95,
+             'interval_hours': 8.0, 'interval_source': 'api_field'},
+            {'symbol': 'ETHUSDT', 'rate': -0.0002, 'apr': -21.9,
+             'interval_hours': 4.0, 'interval_source': 'api_field'},
         ]
         mock_api_instance.close = AsyncMock()
 
@@ -114,19 +149,18 @@ class TestDeltaNeutralBotCLI(unittest.TestCase):
             await check_funding_rates()
 
         # Verify API calls
-        mock_api_instance.get_available_spot_symbols.assert_called_once()
-        mock_api_instance.get_available_perp_symbols.assert_called_once()
-        self.assertEqual(mock_api_instance.get_funding_rate_history.call_count, 2)
+        mock_api_instance.get_all_funding_rates.assert_called_once()
         mock_api_instance.close.assert_called_once()
 
-        # Verify output contains funding rate data
-        print_calls = [call[0][0] for call in mock_print.call_args_list]
-        output_text = ' '.join(print_calls)
+        # Verify output contains funding rate data, including the cadence
+        print_calls = [call[0][0] for call in mock_print.call_args_list if call[0]]
+        output_text = ' '.join(str(c) for c in print_calls)
         self.assertIn('BTCUSDT', output_text)
         self.assertIn('ETHUSDT', output_text)
-        self.assertIn('Summary', output_text)
+        self.assertIn('8h', output_text)
+        self.assertIn('4h', output_text)
 
-    @patch('delta_neutral_bot.AsterApiManager')
+    @patch('cli_commands.AsterApiManager')
     @patch('os.getenv')
     async def test_check_funding_rates_api_error(self, mock_getenv, mock_api_manager_class):
         """Test funding rate fetching when API calls fail."""
@@ -135,19 +169,21 @@ class TestDeltaNeutralBotCLI(unittest.TestCase):
         mock_api_instance = AsyncMock()
         mock_api_manager_class.return_value = mock_api_instance
 
-        # Mock API to return None (failure)
-        mock_api_instance.get_available_spot_symbols.return_value = None
-        mock_api_instance.get_available_perp_symbols.return_value = ['BTCUSDT']
+        # No rows come back at all (discovery failed, or every symbol was skipped
+        # because its funding interval could not be resolved).
+        mock_api_instance.get_all_funding_rates.return_value = []
         mock_api_instance.close = AsyncMock()
 
         # Capture output
         with patch('builtins.print') as mock_print:
             await check_funding_rates()
 
-        # Verify error message
-        print_calls = [call[0][0] for call in mock_print.call_args_list]
-        output_text = ' '.join(print_calls)
-        self.assertIn('ERROR: Could not retrieve symbol lists', output_text)
+        # Verify the user is told, rather than shown an empty table
+        print_calls = [call[0][0] for call in mock_print.call_args_list if call[0]]
+        output_text = ' '.join(str(c) for c in print_calls)
+        self.assertTrue(
+            'No funding rate data' in output_text or 'ERROR' in output_text,
+            f"expected an explicit empty/error message, got: {output_text!r}")
 
     @patch('os.getenv')
     @patch('sys.argv', ['delta_neutral_bot.py', '--pairs'])
@@ -156,8 +192,10 @@ class TestDeltaNeutralBotCLI(unittest.TestCase):
         """Test main function with --pairs argument."""
         # Setup environment variables
         mock_getenv.side_effect = lambda key: self.env_vars.get(key)
-        mock_check_pairs.return_value = asyncio.Future()
-        mock_check_pairs.return_value.set_result(None)
+        # No real coroutine needed: asyncio.run is patched below, so nothing awaits this.
+        # A bare asyncio.Future() here required an ambient event loop, which fails once
+        # any IsolatedAsyncioTestCase in the suite has closed its loop.
+        mock_check_pairs.return_value = None
 
         # Mock asyncio.run to avoid actually running async code
         with patch('asyncio.run') as mock_asyncio_run:
@@ -171,15 +209,17 @@ class TestDeltaNeutralBotCLI(unittest.TestCase):
         """Test main function with --funding-rates argument."""
         # Setup environment variables
         mock_getenv.side_effect = lambda key: self.env_vars.get(key)
-        mock_check_funding.return_value = asyncio.Future()
-        mock_check_funding.return_value.set_result(None)
+        # No real coroutine needed: asyncio.run is patched below, so nothing awaits this.
+        # A bare asyncio.Future() here required an ambient event loop, which fails once
+        # any IsolatedAsyncioTestCase in the suite has closed its loop.
+        mock_check_funding.return_value = None
 
         # Mock asyncio.run to avoid actually running async code
         with patch('asyncio.run') as mock_asyncio_run:
             main()
             mock_asyncio_run.assert_called_once()
 
-    @patch('delta_neutral_bot.AsterApiManager')
+    @patch('cli_commands.AsterApiManager')
     @patch('os.getenv')
     async def test_check_current_positions_success(self, mock_getenv, mock_api_manager_class):
         """Test successful position analysis via CLI."""
@@ -188,33 +228,11 @@ class TestDeltaNeutralBotCLI(unittest.TestCase):
         mock_api_instance = AsyncMock()
         mock_api_manager_class.return_value = mock_api_instance
 
-        # Mock API responses
-        mock_api_instance.analyze_current_positions.return_value = {
-            'BTCUSDT': {
-                'symbol': 'BTCUSDT',
-                'spot_balance': 0.5,
-                'perp_position': -0.5,
-                'is_delta_neutral': True,
-                'imbalance_pct': 2.0,
-                'net_delta': 0.0,
-                'position_value_usd': 15000.0
-            }
-        }
-
-        mock_api_instance.get_spot_account_balances.return_value = [
-            {'asset': 'USDT', 'free': '1000.0', 'locked': '0.0'},
-            {'asset': 'BTC', 'free': '0.5', 'locked': '0.0'}
-        ]
-
-        mock_api_instance.get_perp_account_info.return_value = {
-            'assets': [
-                {'asset': 'USDT', 'walletBalance': '5000.0'},
-                {'asset': 'USDC', 'walletBalance': '0.0'},
-                {'asset': 'USDF', 'walletBalance': '0.0'}
-            ]
-        }
-
-        mock_api_instance.get_funding_rate_history.return_value = [{'fundingRate': '0.0001'}]
+        # One call now returns the whole payload; the CLI stopped assembling it
+        # from analyze_current_positions + get_spot_account_balances +
+        # get_perp_account_info during the refactor.
+        mock_api_instance.get_comprehensive_portfolio_data.return_value = \
+            sample_portfolio_payload()
         mock_api_instance.close = AsyncMock()
 
         # Capture output
@@ -222,19 +240,17 @@ class TestDeltaNeutralBotCLI(unittest.TestCase):
             await check_current_positions()
 
         # Verify API calls
-        mock_api_instance.analyze_current_positions.assert_called_once()
-        mock_api_instance.get_spot_account_balances.assert_called_once()
-        mock_api_instance.get_perp_account_info.assert_called_once()
+        mock_api_instance.get_comprehensive_portfolio_data.assert_called_once()
         mock_api_instance.close.assert_called_once()
 
         # Verify output contains position data
-        print_calls = [call[0][0] for call in mock_print.call_args_list]
-        output_text = ' '.join(print_calls)
+        print_calls = [call[0][0] for call in mock_print.call_args_list if call[0]]
+        output_text = ' '.join(str(c) for c in print_calls)
         self.assertIn('PORTFOLIO SUMMARY', output_text)
         self.assertIn('DELTA-NEUTRAL POSITIONS', output_text)
         self.assertIn('BTCUSDT', output_text)
 
-    @patch('delta_neutral_bot.AsterApiManager')
+    @patch('cli_commands.AsterApiManager')
     @patch('os.getenv')
     async def test_check_current_positions_no_positions(self, mock_getenv, mock_api_manager_class):
         """Test position analysis when no positions exist."""
@@ -243,8 +259,8 @@ class TestDeltaNeutralBotCLI(unittest.TestCase):
         mock_api_instance = AsyncMock()
         mock_api_manager_class.return_value = mock_api_instance
 
-        # Mock empty analysis results
-        mock_api_instance.analyze_current_positions.return_value = {}
+        # Portfolio fetch returns nothing at all.
+        mock_api_instance.get_comprehensive_portfolio_data.return_value = {}
         mock_api_instance.close = AsyncMock()
 
         # Capture output
@@ -252,9 +268,9 @@ class TestDeltaNeutralBotCLI(unittest.TestCase):
             await check_current_positions()
 
         # Verify warning message
-        print_calls = [call[0][0] for call in mock_print.call_args_list]
-        output_text = ' '.join(print_calls)
-        self.assertIn('No position analysis data available', output_text)
+        print_calls = [call[0][0] for call in mock_print.call_args_list if call[0]]
+        output_text = ' '.join(str(c) for c in print_calls)
+        self.assertIn('No portfolio data available', output_text)
 
     @patch('os.getenv')
     @patch('sys.argv', ['delta_neutral_bot.py', '--positions'])
@@ -263,15 +279,17 @@ class TestDeltaNeutralBotCLI(unittest.TestCase):
         """Test main function with --positions argument."""
         # Setup environment variables
         mock_getenv.side_effect = lambda key: self.env_vars.get(key)
-        mock_check_positions.return_value = asyncio.Future()
-        mock_check_positions.return_value.set_result(None)
+        # No real coroutine needed: asyncio.run is patched below, so nothing awaits this.
+        # A bare asyncio.Future() here required an ambient event loop, which fails once
+        # any IsolatedAsyncioTestCase in the suite has closed its loop.
+        mock_check_positions.return_value = None
 
         # Mock asyncio.run to avoid actually running async code
         with patch('asyncio.run') as mock_asyncio_run:
             main()
             mock_asyncio_run.assert_called_once()
 
-    @patch('delta_neutral_bot.AsterApiManager')
+    @patch('cli_commands.AsterApiManager')
     @patch('os.getenv')
     async def test_check_spot_assets_success(self, mock_getenv, mock_api_manager_class):
         """Test successful spot assets fetching via CLI."""
@@ -280,23 +298,14 @@ class TestDeltaNeutralBotCLI(unittest.TestCase):
         mock_api_instance = AsyncMock()
         mock_api_manager_class.return_value = mock_api_instance
 
-        # Mock spot balances response
-        mock_api_instance.get_spot_account_balances.return_value = [
-            {'asset': 'USDT', 'free': '1000.0', 'locked': '0.0'},
-            {'asset': 'BTC', 'free': '0.5', 'locked': '0.0'},
-            {'asset': 'ETH', 'free': '0.0', 'locked': '2.0'}
+        # Balances and prices arrive together in the comprehensive payload.
+        payload = sample_portfolio_payload()
+        payload['spot_balances'] = [
+            {'asset': 'USDT', 'free': '1000.0', 'locked': '0.0', 'usd_value': 1000.0},
+            {'asset': 'BTC', 'free': '0.5', 'locked': '0.0', 'usd_value': 15000.0},
+            {'asset': 'ETH', 'free': '0.0', 'locked': '2.0', 'usd_value': 4000.0},
         ]
-
-        # Mock price responses for non-stablecoins
-        mock_api_instance.get_spot_book_ticker.side_effect = [
-            {'bidPrice': '30000.0'},  # BTCUSDT
-            Exception("No market"),   # BTCUSDC
-            Exception("No market"),   # BTCBUSD
-            {'bidPrice': '2000.0'},   # ETHUSDT
-            Exception("No market"),   # ETHUSDC
-            Exception("No market")    # ETHBUSD
-        ]
-
+        mock_api_instance.get_comprehensive_portfolio_data.return_value = payload
         mock_api_instance.close = AsyncMock()
 
         # Capture output
@@ -304,18 +313,19 @@ class TestDeltaNeutralBotCLI(unittest.TestCase):
             await check_spot_assets()
 
         # Verify API calls
-        mock_api_instance.get_spot_account_balances.assert_called_once()
+        mock_api_instance.get_comprehensive_portfolio_data.assert_called_once()
         mock_api_instance.close.assert_called_once()
 
-        # Verify output contains asset data
-        print_calls = [call[0][0] for call in mock_print.call_args_list]
-        output_text = ' '.join(print_calls)
-        self.assertIn('SPOT ASSET BALANCES', output_text)
-        self.assertIn('USDT', output_text)
+        # Verify output contains asset data. The table lists non-stable holdings;
+        # USDT is deliberately excluded from it, so asserting on USDT here was
+        # asserting the opposite of the intended behaviour.
+        print_calls = [call[0][0] for call in mock_print.call_args_list if call[0]]
+        output_text = ' '.join(str(c) for c in print_calls)
+        self.assertIn('Spot Balances', output_text)
         self.assertIn('BTC', output_text)
         self.assertIn('ETH', output_text)
 
-    @patch('delta_neutral_bot.AsterApiManager')
+    @patch('cli_commands.AsterApiManager')
     @patch('os.getenv')
     async def test_check_spot_assets_no_balances(self, mock_getenv, mock_api_manager_class):
         """Test spot assets when no balances exist."""
@@ -344,105 +354,93 @@ class TestDeltaNeutralBotCLI(unittest.TestCase):
         """Test main function with --spot-assets argument."""
         # Setup environment variables
         mock_getenv.side_effect = lambda key: self.env_vars.get(key)
-        mock_check_spot_assets.return_value = asyncio.Future()
-        mock_check_spot_assets.return_value.set_result(None)
+        # No real coroutine needed: asyncio.run is patched below, so nothing awaits this.
+        # A bare asyncio.Future() here required an ambient event loop, which fails once
+        # any IsolatedAsyncioTestCase in the suite has closed its loop.
+        mock_check_spot_assets.return_value = None
 
         # Mock asyncio.run to avoid actually running async code
         with patch('asyncio.run') as mock_asyncio_run:
             main()
             mock_asyncio_run.assert_called_once()
 
-    @patch('delta_neutral_bot.AsterApiManager')
+    @patch('cli_commands.AsterApiManager')
     @patch('os.getenv')
-    async def test_check_futures_positions_success(self, mock_getenv, mock_api_manager_class):
+    async def test_check_perpetual_positions_success(self, mock_getenv, mock_api_manager_class):
         """Test successful futures positions fetching via CLI."""
         # Setup mocks
         mock_getenv.side_effect = lambda key: self.env_vars.get(key)
         mock_api_instance = AsyncMock()
         mock_api_manager_class.return_value = mock_api_instance
 
-        # Mock perpetual account info with positions
-        mock_api_instance.get_perp_account_info.return_value = {
-            'assets': [
-                {'asset': 'USDT', 'walletBalance': '1000.0'},
-                {'asset': 'USDC', 'walletBalance': '0.0'}
-            ],
-            'positions': [
-                {
-                    'symbol': 'BTCUSDT',
-                    'positionAmt': '0.5',
-                    'entryPrice': '30000.0',
-                    'unrealizedProfit': '500.0',
-                    'leverage': '2'
-                },
-                {
-                    'symbol': 'ETHUSDT',
-                    'positionAmt': '-1.0',
-                    'entryPrice': '2000.0',
-                    'unrealizedProfit': '-100.0',
-                    'leverage': '3'
-                }
-            ]
-        }
-
-        # Mock price responses
-        mock_api_instance.get_perp_book_ticker.side_effect = [
-            {'bidPrice': '31000.0', 'askPrice': '31000.0'},  # BTCUSDT
-            {'bidPrice': '1900.0', 'askPrice': '1900.0'}     # ETHUSDT
+        # Positions and marks arrive together in the comprehensive payload.
+        payload = sample_portfolio_payload()
+        # Numeric fields are numbers, matching what get_comprehensive_portfolio_data
+        # stores after resolving book tickers. The renderer formats mark price and
+        # leverage with %f, so strings raise "Unknown format code 'f'".
+        payload['raw_perp_positions'] = [
+            {'symbol': 'BTCUSDT', 'positionAmt': '0.5', 'entryPrice': '30000.0',
+             'markPrice': 31000.0, 'unrealizedProfit': '500.0', 'leverage': 2,
+             'liquidationPrice': '0'},
+            {'symbol': 'ETHUSDT', 'positionAmt': '-1.0', 'entryPrice': '2000.0',
+             'markPrice': 1900.0, 'unrealizedProfit': '-100.0', 'leverage': 3,
+             'liquidationPrice': '0'},
         ]
-
+        mock_api_instance.get_comprehensive_portfolio_data.return_value = payload
         mock_api_instance.close = AsyncMock()
 
         # Capture output
         with patch('builtins.print') as mock_print:
-            await check_futures_positions()
+            await check_perpetual_positions()
 
         # Verify API calls
-        mock_api_instance.get_perp_account_info.assert_called_once()
+        mock_api_instance.get_comprehensive_portfolio_data.assert_called_once()
         mock_api_instance.close.assert_called_once()
 
         # Verify output contains futures data
-        print_calls = [call[0][0] for call in mock_print.call_args_list]
-        output_text = ' '.join(print_calls)
-        self.assertIn('FUTURES/PERPETUAL POSITIONS', output_text)
+        print_calls = [call[0][0] for call in mock_print.call_args_list if call[0]]
+        output_text = ' '.join(str(c) for c in print_calls)
         self.assertIn('BTCUSDT', output_text)
         self.assertIn('ETHUSDT', output_text)
-        self.assertIn('PnL %', output_text)
 
-    @patch('delta_neutral_bot.AsterApiManager')
+    @patch('cli_commands.AsterApiManager')
     @patch('os.getenv')
-    async def test_check_futures_positions_no_positions(self, mock_getenv, mock_api_manager_class):
+    async def test_check_perpetual_positions_no_positions(self, mock_getenv, mock_api_manager_class):
         """Test futures positions when no active positions exist."""
         # Setup mocks
         mock_getenv.side_effect = lambda key: self.env_vars.get(key)
         mock_api_instance = AsyncMock()
         mock_api_manager_class.return_value = mock_api_instance
 
-        # Mock empty positions
-        mock_api_instance.get_perp_account_info.return_value = {
-            'assets': [{'asset': 'USDT', 'walletBalance': '1000.0'}],
-            'positions': []
-        }
+        # Account funded, but no open perp positions.
+        payload = sample_portfolio_payload()
+        payload['raw_perp_positions'] = []
+        payload['analyzed_positions'] = []
+        mock_api_instance.get_comprehensive_portfolio_data.return_value = payload
         mock_api_instance.close = AsyncMock()
 
         # Capture output
         with patch('builtins.print') as mock_print:
-            await check_futures_positions()
+            await check_perpetual_positions()
 
         # Verify warning message
-        print_calls = [call[0][0] for call in mock_print.call_args_list]
-        output_text = ' '.join(print_calls)
-        self.assertIn('No active futures positions found', output_text)
+        print_calls = [call[0][0] for call in mock_print.call_args_list if call[0]]
+        output_text = ' '.join(str(c) for c in print_calls)
+        self.assertIn('No active perpetual positions', output_text)
 
     @patch('os.getenv')
-    @patch('sys.argv', ['delta_neutral_bot.py', '--futures'])
-    @patch('delta_neutral_bot.check_futures_positions')
+    # The flag is --perpetual; --futures was never a valid argument, so argparse
+    # exited with code 2 before main() could dispatch anything.
+    @patch('sys.argv', ['delta_neutral_bot.py', '--perpetual'])
+    @patch('delta_neutral_bot.check_perpetual_positions')
     def test_main_futures_argument(self, mock_check_futures, mock_getenv):
-        """Test main function with --futures argument."""
+        """Test main function with --perpetual argument."""
         # Setup environment variables
         mock_getenv.side_effect = lambda key: self.env_vars.get(key)
-        mock_check_futures.return_value = asyncio.Future()
-        mock_check_futures.return_value.set_result(None)
+        # No real coroutine needed: asyncio.run is patched below, so nothing awaits this.
+        # A bare asyncio.Future() here required an ambient event loop, which fails once
+        # any IsolatedAsyncioTestCase in the suite has closed its loop.
+        mock_check_futures.return_value = None
 
         # Mock asyncio.run to avoid actually running async code
         with patch('asyncio.run') as mock_asyncio_run:
@@ -483,49 +481,12 @@ class TestDeltaNeutralBotCLI(unittest.TestCase):
                 self.assertIn('ERROR: Not all required environment variables', output_text)
 
 
-class TestAsyncRunner(unittest.TestCase):
-    """Helper class to run async tests."""
-
-    def run_async_test(self, coro):
-        """Run an async test."""
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        try:
-            return loop.run_until_complete(coro)
-        finally:
-            loop.close()
-
-    def test_check_available_pairs_async(self):
-        """Run the async test for check_available_pairs."""
-        test_instance = TestDeltaNeutralBotCLI()
-        test_instance.setUp()
-        self.run_async_test(test_instance.test_check_available_pairs_success())
-
-    def test_check_funding_rates_async(self):
-        """Run the async test for check_funding_rates."""
-        test_instance = TestDeltaNeutralBotCLI()
-        test_instance.setUp()
-        self.run_async_test(test_instance.test_check_funding_rates_success())
-
-    def test_check_current_positions_async(self):
-        """Run the async test for check_current_positions."""
-        test_instance = TestDeltaNeutralBotCLI()
-        test_instance.setUp()
-        self.run_async_test(test_instance.test_check_current_positions_success())
-
-    def test_check_spot_assets_async(self):
-        """Run the async test for check_spot_assets."""
-        test_instance = TestDeltaNeutralBotCLI()
-        test_instance.setUp()
-        self.run_async_test(test_instance.test_check_spot_assets_success())
-
-    def test_check_futures_positions_async(self):
-        """Run the async test for check_futures_positions."""
-        test_instance = TestDeltaNeutralBotCLI()
-        test_instance.setUp()
-        self.run_async_test(test_instance.test_check_futures_positions_success())
+# TestAsyncRunner used to live here: five sync wrappers that hand-built an event
+# loop and drove the async tests above, because as a plain TestCase they never ran
+# on their own. TestDeltaNeutralBotCLI is now an IsolatedAsyncioTestCase, so they
+# run directly and the wrappers were duplicate coverage that also left a closed
+# event loop behind for later tests in the suite.
 
 
 if __name__ == '__main__':
-    # Run both sync and async tests
     unittest.main(verbosity=2)

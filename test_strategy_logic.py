@@ -8,6 +8,92 @@ import unittest
 from strategy_logic import DeltaNeutralLogic
 
 
+class TestDriftedPositionVisibility(unittest.TestCase):
+    """A position that drifts past the balance tolerance must stay visible.
+
+    `is_delta_neutral` used to mean "imbalance <= 2%", and it gates both the health
+    check and the dashboard's closeable list. So the moment a position drifted past
+    2% it disappeared from monitoring AND could no longer be closed from the UI --
+    precisely the position that needed attention. It now means "both legs present",
+    with `is_balanced` carrying the health question.
+    """
+
+    @staticmethod
+    def _positions(spot_qty, perp_qty):
+        return DeltaNeutralLogic.analyze_position_data(
+            perp_positions=[{
+                'symbol': 'BTCUSDT', 'positionAmt': str(perp_qty),
+                'markPrice': '100.0', 'leverage': '1',
+            }],
+            spot_balances={'BTC': spot_qty},
+            perp_symbol_map={'BTCUSDT': {'baseAsset': 'BTC'}},
+        )
+
+    def test_balanced_position_is_both_neutral_and_balanced(self):
+        pos = self._positions(10.0, -10.0)['BTCUSDT']
+        self.assertTrue(pos['is_delta_neutral'])
+        self.assertTrue(pos['is_balanced'])
+
+    def test_drifted_position_stays_visible_but_flagged_unbalanced(self):
+        # 8% imbalance: well past the 2% tolerance.
+        pos = self._positions(10.8, -10.0)['BTCUSDT']
+        self.assertTrue(pos['is_delta_neutral'],
+                        "a drifted position must remain listed and closeable")
+        self.assertFalse(pos['is_balanced'])
+        self.assertGreater(pos['imbalance_pct'], 5.0)
+
+    def test_single_legged_position_is_not_delta_neutral(self):
+        pos = self._positions(0.0, -10.0)['BTCUSDT']
+        self.assertFalse(pos['is_delta_neutral'],
+                         "a naked leg is not a delta-neutral position")
+
+    def test_imbalance_warnings_are_actually_reachable(self):
+        """These branches were dead code: filtered to <=2%, then warned at >5%."""
+        drifted = self._positions(10.8, -10.0)['BTCUSDT']
+        health_issues, critical_issues, count = \
+            DeltaNeutralLogic.perform_portfolio_health_analysis([drifted])
+
+        self.assertEqual(count, 1)
+        self.assertTrue(health_issues or critical_issues,
+                        "an 8% imbalance must produce a health warning")
+
+    def test_critical_imbalance_is_escalated(self):
+        badly_drifted = self._positions(12.0, -10.0)['BTCUSDT']  # ~16.7%
+        _health, critical, _count = \
+            DeltaNeutralLogic.perform_portfolio_health_analysis([badly_drifted])
+        self.assertTrue(any('imbalance' in c.lower() for c in critical))
+
+
+class TestFundingIntervalAnnualization(unittest.TestCase):
+    """APR must follow each symbol's actual settlement cadence, not a constant."""
+
+    # 0.0002 per interval clears ANNUALIZED_APR_THRESHOLD (15%) on BOTH cadences:
+    # 21.9% at 8h, 43.8% at 4h. A smaller rate would leave the 8h row filtered out
+    # by the display threshold and the comparison would silently test nothing.
+    RATES = {'A4H': [0.0002] * 20, 'A8H': [0.0002] * 20}
+    PRICES = {'A4H': 100.0, 'A8H': 100.0}
+
+    def test_four_hour_symbol_earns_double_an_eight_hour_symbol(self):
+        opps = DeltaNeutralLogic.analyze_funding_opportunities(
+            self.RATES, self.PRICES, interval_hours={'A4H': 4.0, 'A8H': 8.0})
+        by_symbol = {o['symbol']: o['annualized_apr'] for o in opps}
+
+        self.assertIn('A4H', by_symbol)
+        self.assertIn('A8H', by_symbol)
+        self.assertAlmostEqual(by_symbol['A4H'], by_symbol['A8H'] * 2, places=6)
+
+    def test_symbol_with_unknown_interval_is_skipped_not_guessed(self):
+        opps = DeltaNeutralLogic.analyze_funding_opportunities(
+            self.RATES, self.PRICES, interval_hours={'A4H': 4.0})
+        self.assertEqual([o['symbol'] for o in opps], ['A4H'])
+
+    def test_eight_hour_apr_matches_the_old_constant(self):
+        """Sanity check that the refactor did not shift the 8h baseline."""
+        opps = DeltaNeutralLogic.analyze_funding_opportunities(
+            {'A8H': [0.0002] * 20}, {'A8H': 100.0}, interval_hours={'A8H': 8.0})
+        self.assertAlmostEqual(opps[0]['annualized_apr'], 0.0002 * 3 * 365 * 100, places=6)
+
+
 class TestDeltaNeutralLogic(unittest.TestCase):
     """Test suite for DeltaNeutralLogic static methods."""
 
@@ -106,7 +192,10 @@ class TestDeltaNeutralLogic(unittest.TestCase):
         health = DeltaNeutralLogic.check_position_health(mock_imbalanced_pos, spot_balance_qty)
 
         self.assertAlmostEqual(health['net_delta'], 1.0, places=6)  # 11 + (-10)
-        self.assertAlmostEqual(health['imbalance_percentage'], 10.0, places=6)  # 1/10 * 100
+        # Denominator is max(|spot|, |perp|) = 11, matching analyze_position_data.
+        # It was |perp| = 10 here, so the same position reported 10% on one screen
+        # and 9.09% on another.
+        self.assertAlmostEqual(health['imbalance_percentage'], 100 / 11, places=6)
 
         # Scenario 3: High liquidation risk (liquidation price very close to mark price)
         mock_risky_pos = {
@@ -139,7 +228,20 @@ class TestDeltaNeutralLogic(unittest.TestCase):
         health_5x = DeltaNeutralLogic.check_position_health(mock_leveraged_pos, spot_balance_qty, leverage=5)
         self.assertEqual(health_5x['leverage_risk_factor'], 5)
         self.assertTrue(health_5x['leverage_warning'])
-        self.assertEqual(health_5x['liquidation_risk_level'], 'CRITICAL')  # Forces critical due to leverage != 1
+
+        # Wrong leverage is reported in its own field rather than overwriting the
+        # liquidation reading. Overwriting it destroyed information: a position at
+        # 5x that was ALSO near liquidation reported 'CRITICAL' instead of 'HIGH',
+        # and determine_rebalance_action tested only for 'HIGH' -- so the worst
+        # state the bot can reach returned ACTION_HOLD.
+        self.assertTrue(health_5x['leverage_critical'])
+        self.assertIn(health_5x['liquidation_risk_level'], ('LOW', 'MEDIUM', 'HIGH'))
+
+        # ...and it must now actually provoke a close.
+        self.assertEqual(
+            DeltaNeutralLogic.determine_rebalance_action(health_5x),
+            'ACTION_CLOSE_POSITION',
+        )
 
     def test_action_determination(self):
         """Test determine_rebalance_action decision logic."""
@@ -377,9 +479,14 @@ class TestStrategyConstants(unittest.TestCase):
         # Should require meaningful amount of historical data
         self.assertGreaterEqual(MIN_FUNDING_RATE_COUNT, 5)
 
-        # Volatility threshold should be reasonable
+        # Volatility threshold should be reasonable.
+        #
+        # This is a coefficient of variation (stdev/mean). The old bound of < 1.0
+        # encoded the old 0.05 setting, which demanded a funding series that barely
+        # moved -- real series routinely exceed CV 1, so it filtered out
+        # essentially every genuine opportunity.
         self.assertGreater(MAX_VOLATILITY_THRESHOLD, 0.0)
-        self.assertLess(MAX_VOLATILITY_THRESHOLD, 1.0)
+        self.assertLess(MAX_VOLATILITY_THRESHOLD, 5.0)
 
         # Risk thresholds should be conservative
         self.assertGreater(LIQUIDATION_BUFFER_PCT, 0.0)

@@ -492,11 +492,27 @@ async def execute_two_leg(
     verify_timeout_s: float = 20.0,
     unwind_backoff_base_s: float = 1.0,
     verify_poll_interval_s: float = 1.0,
+    hedge_qty_from_pilot: Optional[Callable[[float], float]] = None,
 ) -> TwoLegOutcome:
     """Open a hedged pair, or leave nothing behind.
 
     Order of operations, per leg: sweep -> submit -> cancel -> verify -> decide.
     The hedge leg is sized from the pilot's ACTUAL fill.
+
+    `hedge_qty_from_pilot` overrides that sizing. It receives the pilot's filled
+    quantity and returns the quantity to SUBMIT on the hedge leg. Default is
+    identity, i.e. hedge exactly what the pilot filled.
+
+    The hook exists for venues where part of the hedge is already held. Aster's
+    spot+perp bot is the case in point: the hedge is a spot balance, so if you
+    already own 0.4 BTC and the pilot shorted 1.0 BTC, the order to place is 0.6,
+    not 1.0 -- buying the full 1.0 would leave you 0.4 long, not neutral. Sizing
+    like that is bot-specific and belongs to the caller, which is why it arrives
+    as a callable rather than being baked in here.
+
+    If the hook returns approximately zero the hedge is already satisfied: no
+    order is sent and the pair is reported hedged at the pilot's fill. That can
+    only happen when a hook is supplied, so default behaviour is unchanged.
 
     Raises HaltedError immediately if a halt sentinel is already present.
     """
@@ -552,7 +568,20 @@ async def execute_two_leg(
                              notes=notes)
 
     # Size the hedge from what actually filled, never from the original intent.
-    hedge_qty = pilot_res.filled_qty
+    hedge_qty = (hedge_qty_from_pilot(pilot_res.filled_qty)
+                 if hedge_qty_from_pilot is not None
+                 else pilot_res.filled_qty)
+
+    # A hook may report the hedge as already covered (e.g. a spot balance already
+    # held). Sending a zero-size order would be rejected and would then unwind a
+    # pilot leg that is in fact correctly hedged.
+    if hedge_qty <= _tolerance(pilot_res.filled_qty, hedge.amount_tick):
+        notes.append(f"hedge already covered; no order sent "
+                     f"(pilot filled {pilot_res.filled_qty:.10g})")
+        return TwoLegOutcome(ok=True, pilot=pilot_res, hedge=None,
+                             hedged_qty=pilot_res.filled_qty,
+                             reason="pilot filled; hedge already held", notes=notes)
+
     if abs(hedge_qty - hedge.intent_qty) > _tolerance(hedge.intent_qty, hedge.amount_tick):
         notes.append(f"hedge resized {hedge.intent_qty:.10g} -> {hedge_qty:.10g} "
                      f"to match pilot fill")
@@ -595,15 +624,25 @@ async def execute_two_leg(
 
     # ---- decision table --------------------------------------------------
     if hedge_res.status is LegStatus.FILLED:
-        hedged = min(pilot_res.filled_qty, hedge_res.filled_qty)
+        # Size already held before this cycle and counted toward the hedge. Zero
+        # without a sizing hook, so this reduces to the plain pilot-vs-hedge
+        # comparison in the default case.
+        already_covered = max(0.0, pilot_res.filled_qty - hedge_qty)
+        hedge_coverage = already_covered + hedge_res.filled_qty
+
+        hedged = min(pilot_res.filled_qty, hedge_coverage)
         # Any leftover imbalance is real, unhedged delta. Trim the longer leg.
-        imbalance = abs(pilot_res.filled_qty - hedge_res.filled_qty)
+        imbalance = abs(pilot_res.filled_qty - hedge_coverage)
         if imbalance > _tolerance(pilot_res.intent_qty, pilot.amount_tick):
             notes.append(f"legs imbalanced by {imbalance:.10g}; trimming to {hedged:.10g}")
-            longer, longer_base = ((pilot, pilot_baseline)
-                                   if pilot_res.filled_qty > hedge_res.filled_qty
-                                   else (hedge, hedge_baseline))
-            target = longer_base + (hedged if longer.side == "buy" else -hedged)
+            if pilot_res.filled_qty > hedge_coverage:
+                # Pilot over-exposed relative to the hedge: cut the pilot back.
+                longer, longer_base, keep = pilot, pilot_baseline, hedged
+            else:
+                # Hedge over-filled: cut the hedge back to what the pilot supports.
+                longer, longer_base = hedge, hedge_baseline
+                keep = max(0.0, hedge_res.filled_qty - imbalance)
+            target = longer_base + (keep if longer.side == "buy" else -keep)
             if not await unwind_leg(_with_qty(longer, imbalance),
                                     baseline_signed_qty=target,
                                     attempts=unwind_attempts, halt_path=halt_path,

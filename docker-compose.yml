@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   dn_bot:
     build: .
@@ -10,11 +8,21 @@ services:
     stdin_open: true
     # Allocate a pseudo-TTY
     tty: true
-    # Mount the source code into the container for live updates
+    environment:
+      # Where the halt sentinel is written. Must point at the mounted volume
+      # below, or a halt vanishes on the next `docker compose up` and the bot
+      # happily resumes trading on top of unhedged exposure.
+      ASTER_DN_DATA_DIR: /app/data
     volumes:
-      - ./delta_neutral_bot.py:/app/delta_neutral_bot.py
-      - ./aster_api_manager.py:/app/aster_api_manager.py
-      - ./strategy_logic.py:/app/strategy_logic.py
-      - ./ui_renderers.py:/app/ui_renderers.py
-      - ./cli_commands.py:/app/cli_commands.py
-      - ./utils.py:/app/utils.py
+      # The whole project, not a hand-maintained file list.
+      #
+      # This used to name six individual source files, which silently excluded
+      # two_leg.py and funding_economics.py: editing either on the host had no
+      # effect on a running container, so the bot could run stale
+      # execution-safety code while the file on disk looked correct. Every new
+      # module hit the same trap. Mounting the directory removes the maintenance
+      # step. (Add `:ro` if you want the code immutable at runtime -- nothing on
+      # the bot's own path writes into /app, only into /app/data below.)
+      - .:/app
+      # Writable state, so halt.json survives a container recreate.
+      - ./data:/app/data
